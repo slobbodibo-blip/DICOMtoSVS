@@ -1,6 +1,8 @@
 
 import os
 import shutil
+from plistlib import InvalidFileException
+
 import numpy as np
 import zipfile
 import natsort
@@ -28,6 +30,7 @@ from typing import (
 import warnings
 from pydicom.datadict import keyword_for_tag
 from pydicom.multival import MultiValue
+from pydicom.errors import InvalidDicomError
 import random
 
 
@@ -51,15 +54,15 @@ def extract_icc_profile(dicom_path):
     else:
         raise ValueError("No ICC Profile found in the DICOM file.")
 
-def get_filename_no_ext(path):
-    filename_noext_list = []
-    filenames = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f)) and 'DS_Store' not in f]  #only look at files, not directories #exclude Mac OS files
-    for filename in filenames:
-        #if not os.path.isdir(path + '/' + filename): 
-        (name, ext) = os.path.splitext(filename)
-        if not ext:
-            filename_noext_list.append(filename)
-    return filename_noext_list
+# def get_filename_no_ext(path):
+#     filename_noext_list = []
+#     filenames = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f)) and 'DS_Store' not in f]  #only look at files, not directories #exclude Mac OS files
+#     for filename in filenames:
+#         #if not os.path.isdir(path + '/' + filename):
+#         (name, ext) = os.path.splitext(filename)
+#         if not ext:
+#             filename_noext_list.append(filename)
+#     return filename_noext_list
 
 
 def extract_metadata_filemeta(ds):
@@ -198,38 +201,62 @@ def merge_dicts(dict1, dict2):
         return dict1.copy() if dict1 is not None else {}
     return {**dict1, **dict2}
 
+def is_dicom(path):
+    try:
+        # Attempt to read the file as DICOM
+        pydicom.dcmread(path, stop_before_pixels=True)
+        return True
+    except InvalidDicomError:
+        return False
+    except Exception as e:
+        print(f"Unexpected error while reading file: {e}")
+        return False
+
+def find_all_possible_dcm(path_to_dcm):
+    dcm_list = []
+    for dirpath, _, filenames in os.walk(path_to_dcm):
+        for f in filenames:
+            if f.endswith('.dcm') and 'graphics' not in f:
+                dcm_list.append(os.path.join(dirpath, f))
+                print(f'DCM file added: {f}')
+            else:
+                filepath = os.path.join(dirpath, f)
+                if is_dicom(filepath):
+                    print(f'DCM file without extension added: {f}')
+                    dcm_list.append(filepath)
+                else:
+                    print(f'!non dcm file found, ignore: {f}')
+                    pass
+
+    print(f'Total number of possible DCM files: {len(dcm_list)}')
+    return dcm_list
+
 def decipher_dcm_folder(path_to_dcm):
     #list of files .dcm while excluding annotations
-    dcm_list = [f for f in os.listdir(path_to_dcm) if f.endswith('.dcm') and 'graphics' not in f]
+    dcm_list = find_all_possible_dcm(path_to_dcm)
+
     #handling cases where dicom files do not have the .dcm extension (=> DICOM conversion with SlideMaster by 3DHistech does not add the .dcm extension to converted files)
     if len(dcm_list)==0: #no dcm files detected
-        print('No .dcm file detected.')
-        filename_noext_list = get_filename_no_ext(path_to_dcm)
-        if len(filename_noext_list)!=0: #if files without extension are identified, try to add the .dcm extension to be handled like it
-            print('Files without extension present. Do the DICOM files originate from a conversion by SlideMaster? Trying to rename files to add the extension.')
-            for filename in filename_noext_list:
-                os.rename(path_to_dcm + '/' + filename, path_to_dcm + '/' + filename + '.dcm')
-                #list of files .dcm while excluding annotations
-                dcm_list = [f for f in os.listdir(path_to_dcm) if f.endswith('.dcm') and 'graphics' not in f]
-        else:
-            print('No identified file to convert.')
-    else:
-        pass
-    
+        print('No dcm file detected')
+        sys.exit()
+
     type_list = []
     dcm_volume_list = []
-    for dcm in dcm_list:
-        ds = pydicom.dcmread(path_to_dcm + '/' + dcm, force=True)
+    for dcm_with_path in dcm_list:
+        ds = pydicom.dcmread(dcm_with_path, force=True)
         img_type_str = ds[0x0008, 0x0008].value
         #img_type_bytes = ds.get_item(Tag(0x0008, 0x0008)).value
         #img_type_str = img_type_bytes.decode('utf-8')
         # Define the four possible image types
         possible_types = ['THUMBNAIL', 'VOLUME', 'LABEL', 'OVERVIEW', 'REGIONLOCALIZER', 'LOCALIZER']
         # Extract the nature of the image type
-        extracted_type = [img_type for img_type in possible_types if img_type in img_type_str][0]
-        type_list.append(extracted_type)
-        if extracted_type == 'VOLUME':
-            dcm_volume_list.append(dcm)
+        extracted_types = [img_type for img_type in possible_types if img_type in img_type_str]
+        if len(extracted_types) == 0:
+            print(f'No possible types found for this file!!!({img_type_str}, {dcm_with_path})')
+
+        type_list.append(extracted_types[0])
+        if extracted_types[0] == 'VOLUME':
+            dcm_volume_list.append(dcm_with_path)
     #dictionary between dcm_name and type
     dcm_type_dict = dict(zip(type_list, dcm_list))
     #thumbnail
@@ -249,7 +276,7 @@ def decipher_dcm_folder(path_to_dcm):
     dcm_levels_width_list = []
     dcm_levels_height_list = []
     for dcm in dcm_volume_list:
-        ds = pydicom.dcmread(path_to_dcm + '/' + dcm)
+        ds = pydicom.dcmread(dcm)
         dcm_levels_list.append(dcm)
         dcm_levels_width_list.append(ds.TotalPixelMatrixColumns) #width
         dcm_levels_height_list.append(ds.TotalPixelMatrixRows) #height
@@ -696,7 +723,7 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
     '''
 
     #list of all files +/- unzip them
-    if is_zipped==True:
+    if is_zipped==True: #TODO, check zipp file processing...
         #list of zipped files
         WSI_list = [f for f in os.listdir(path_to_folder) if f.endswith(".zip")]
         print('Unzipping files...')
@@ -710,13 +737,17 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
         #list of folder of DICOM images. One folder per image
         WSI_dir = [f for f in os.listdir(path_unzip) if 'DS_Store' not in f and 'MACOSX' not in f and os.path.isdir(path_unzip+'/'+f)] #exclude Mac OS files and other non directory 
         WSI_dir = os_sorted(WSI_dir)
+
     else: #no zipped files, list all image folder
         WSI_dir = [f for f in os.listdir(path_to_folder) if 'DS_Store' not in f and 'MACOSX' not in f and os.path.isdir(path_to_folder+'/'+f)] #exclude Mac OS files other non directory
         WSI_dir = os_sorted(WSI_dir)
         path_unzip = path_to_folder
     print(f'Number of identified WSI is: {len(WSI_dir)}')
+
     if len(WSI_dir)==0:
         print('No detected DICOM WSI to convert, please point to a folder containing either one or several unzipped DICOM folders or one or several zipped DICOM folders.')
+        sys.exit()
+
     #define output_path
     path_output = path_to_folder+'_output'
     if not os.path.exists(path_output):
@@ -732,11 +763,12 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
             WSI_name_todcm = WSI_name + '/' + list_files[0]
         else:
             WSI_name_todcm = WSI_name
-        
+
         #list all files of the DICOM folder
         #WSI_files = [f for f in os.listdir(path_unzip + '/' + WSI_name_todcm) if f.endswith(".dcm") and 'graphics' not in f]  #we ignore .dcm.import and graphics.dcm files
         thumbnail_dcm_name, overview_dcm_name, label_dcm_name, dcm_levels_dict, pyramidal_levels, dcm_levels_width_dict, dcm_levels_height_dict = decipher_dcm_folder(path_to_dcm = path_unzip + '/' + WSI_name_todcm)
-        biggest_file_path = path_unzip + '/' + WSI_name_todcm + '/' + dcm_levels_dict[1]
+
+        biggest_file_path = dcm_levels_dict[1]
 
         #open the image with WSIDicom and 
         ds = pydicom.dcmread(biggest_file_path, force=True)
@@ -777,7 +809,7 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
             while os.path.exists(path_output + '/' + WSI_name + '.tiff'):
                 WSI_name = f'ANONYM{random_number}_{count}'
                 count+=1
-        
+
         #quality_jpeg
         try:
             quality_jpeg = int(metadata['(0040, 0555)'][6]['(0040, a30a)'])  #Aperio GT450DX. Not found in 3DHistech slides from Pannoramic scan II
@@ -976,7 +1008,7 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
                 
                 # add the thumbnail image as a separate series, in second position
                 if thumbnail_dcm_name is not None:
-                    ds = pydicom.dcmread(path_unzip + '/' + WSI_name_todcm + '/' + thumbnail_dcm_name, force=True)
+                    ds = pydicom.dcmread(thumbnail_dcm_name, force=True)
                     photometric_interpretation = ds.PhotometricInterpretation
                     thumbnail_array = ds.pixel_array #ycbcr or rgb depending on how the jpeg is encoded
                     if photometric_interpretation != 'MONOCHROME2' and color_space=='ycbcr': #if not a grayscale image/fluorescence image => brightfield image
@@ -988,14 +1020,14 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
                     #find a pyramidal level suited for thumbnail creation
                     thumnbnail_level = find_first_level_below_pixel_limit(dcm_levels_height_dict, dcm_levels_width_dict, pixel_limit=4096 * 4096)
                     if thumnbnail_level is not None:
-                        ds = pydicom.dcmread(path_unzip + '/' + WSI_name_todcm + '/' + dcm_levels_dict[thumnbnail_level], force=True)
+                        ds = pydicom.dcmread(dcm_levels_dict[thumnbnail_level], force=True)
                         photometric_interpretation = ds.PhotometricInterpretation
                         thumbnail_tiles = ds.pixel_array #ycbcr or rgb depending on how the jpeg is encoded
                         thumbnail_array = create_img_from_tiles(ds, thumbnail_tiles, color_space) #always RGB                    
                     else: #not level suited for thumbnail creation
                         print('No level suited for thumbnail creation. Creating a lower level resolution, which may take some time')                        
                         max_level = max(pyramidal_levels) #create thumbnail from maximum level/lowest resolution
-                        ds = pydicom.dcmread(path_unzip + '/' + WSI_name_todcm + '/' + dcm_levels_dict[max_level], force=True)
+                        ds = pydicom.dcmread(dcm_levels_dict[max_level], force=True)
                         photometric_interpretation = ds.PhotometricInterpretation
                         #pyramidalize the image and then create thumbnail
                         thumbnail_array = get_sub_resolution_from_ds(ds, color_space, downsample=16)
@@ -1029,7 +1061,7 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
                 def write_pyramidal_level(level, tile_size): #absolute level ID. 4 means that the width and height are divided by 4 as compared to the full resolution image.
                     level_shape = (dcm_levels_width_dict[level], dcm_levels_height_dict[level])
                     image_description_level = f'Aperio Leica Biosystems (fake): {tag_dict["Private Creator"]} {tag_dict["Manufacturer"]} {tag_dict["Manufacturer Model Name"]} v{tag_dict["Software Versions"]} \n{dcm_levels_width_dict[level]} [0,0,{dcm_levels_width_dict[level]}] ({tag_dict["Columns"]}x{tag_dict["Rows"]}) {compression_name} Q={quality_jpeg}|AppMag = {tag_dict["Objective Lens Power"]}|MPP = {round(pixel_size*level, 6)}|ScanScope ID = {tag_dict["Device Serial Number"]}|ScannerType = {tag_dict["Manufacturer Model Name"]}|SessionMode = {tag_dict["Session Mode"]}'
-                    ds = pydicom.dcmread(path_unzip + '/' + WSI_name_todcm + '/' + dcm_levels_dict[level], force=True)
+                    ds = pydicom.dcmread(dcm_levels_dict[level], force=True)
                     photometric_interpretation = ds.PhotometricInterpretation
                     if photometric_interpretation == 'MONOCHROME2': #grayscale, 
                         shape_arg = (level_shape[1], level_shape[0])
@@ -1066,7 +1098,7 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
                 #label image?
                 if label==True:
                     if label_dcm_name is not None and anonymize==False:
-                        ds = pydicom.dcmread(path_unzip + '/' + WSI_name_todcm + '/' + label_dcm_name, force=True)
+                        ds = pydicom.dcmread(label_dcm_name, force=True)
                         try: #the array should be directly accessible
                             label_array = ds.pixel_array
                         except ValueError as e: #tested WSI from Roche appears to have an improper ds.Rows value (1400 instead of 1199)
@@ -1100,7 +1132,7 @@ def from_DICOM_to_SVS(path_to_folder, is_zipped: bool, label: bool, macro: bool,
                 #macro image?
                 if macro==True:
                     if overview_dcm_name is not None and anonymize==False:
-                        ds = pydicom.dcmread(path_unzip + '/' + WSI_name_todcm + '/' + overview_dcm_name, force=True)
+                        ds = pydicom.dcmread(overview_dcm_name, force=True)
                         macro_array = ds.pixel_array
                         macro_shape = macro_array.shape
                         photometric_interpretation = ds.PhotometricInterpretation
